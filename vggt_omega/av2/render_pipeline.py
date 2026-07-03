@@ -1,5 +1,3 @@
-"""Merge metric VGGT depth with AV2 calibrations and render camera views."""
-
 from __future__ import annotations
 
 import argparse
@@ -13,7 +11,20 @@ from av2.utils.io import read_img
 from PIL import Image
 
 from vggt_omega.av2.dataset import AV2SceneDataset, DEFAULT_AV2_CROP_BOTTOM
+from vggt_omega.av2.dynamic_filtering import (
+    DEFAULT_BOX_FILTER_EXPAND_RATIO,
+    DEFAULT_MIN_BOX_DISPLACEMENT_M,
+    DEFAULT_SCALE_ERROR_THRESHOLD,
+    DepthPointFilter,
+    apply_dynamic_filter_to_predictions,
+)
+from vggt_omega.av2.utils.sam2_masks import DEFAULT_SAM2_MODEL_ID
 from vggt_omega.av2.inference import run_vggt_on_av2_chunk
+from vggt_omega.av2.pipeline_config import (
+    DEFAULT_RENDER_PIPELINE_CONFIG,
+    config_defaults,
+    load_render_pipeline_config,
+)
 from vggt_omega.av2.metric_alignment import (
     build_pinhole_camera,
     depth_to_cam_points,
@@ -52,6 +63,7 @@ def merge_depth_maps_in_ego0(
     color_image_paths: list[Path],
     *,
     conf_percentile: float = 0.0,
+    point_filters: list[DepthPointFilter] | None = None,
 ) -> MergedPointCloud:
     """Fuse metric depth maps into the ego frame at the first camera timestamp."""
     frame_0 = frames[0]
@@ -75,14 +87,23 @@ def merge_depth_maps_in_ego0(
             threshold = np.percentile(valid_conf, conf_percentile)
             keep &= pixel_conf >= threshold
 
-        points_ego = camera.ego_SE3_cam.transform_point_cloud(points_cam[keep])
+        points_cam = points_cam[keep]
+        uv = uv[keep]
+        points_ego = camera.ego_SE3_cam.transform_point_cloud(points_cam)
+        if point_filters:
+            keep_ego = np.ones(len(points_ego), dtype=bool)
+            for point_filter in point_filters:
+                keep_ego &= point_filter.keep(points_ego, frame)
+            points_ego = points_ego[keep_ego]
+            uv = uv[keep_ego]
+
         points_ego0 = motion_compensate_ego(points_ego, frame.city_SE3_ego, frame_0.city_SE3_ego)
 
         all_points_ego0.append(points_ego0)
         all_colors.append(
             sample_image_colors(
                 color_image_paths[index],
-                uv[keep],
+                uv,
                 camera_width=camera.width_px,
                 camera_height=camera.height_px,
             )
@@ -233,6 +254,14 @@ def run_render_pipeline(
     align_metric: bool = True,
     save_comparison: bool = True,
     comparison_fps: float | None = None,
+    filter_dynamic: bool = True,
+    dynamic_filter_mode: str = "combined",
+    scale_error_threshold: float = DEFAULT_SCALE_ERROR_THRESHOLD,
+    min_box_displacement_m: float = DEFAULT_MIN_BOX_DISPLACEMENT_M,
+    box_expand_ratio: float = DEFAULT_BOX_FILTER_EXPAND_RATIO,
+    sam2_model_id: str = DEFAULT_SAM2_MODEL_ID,
+    sam2_cache_dir: str | Path | None = None,
+    debug_dynamic_filter: bool = False,
 ) -> tuple[MergedPointCloud, list[Path], Path | None]:
     output_dir = Path(output_dir)
     data_root = Path(data_root)
@@ -262,6 +291,27 @@ def run_render_pipeline(
         pred_width,
         pred_height,
     )
+    native_camera = build_pinhole_camera(data_root, frames[0], crop_bottom_pixels)
+
+    dynamic_mode = "none" if not filter_dynamic else dynamic_filter_mode
+    predictions, point_filters = apply_dynamic_filter_to_predictions(
+        predictions,
+        frames,
+        image_paths,
+        native_camera,
+        data_root,
+        mode=dynamic_mode,
+        crop_bottom=crop_bottom_pixels,
+        sam2_model_id=sam2_model_id,
+        device=device,
+        sam2_cache_dir=sam2_cache_dir,
+        debug_dir=(output_dir / "dynamic_debug") if debug_dynamic_filter else None,
+        pred_height=pred_height,
+        pred_width=pred_width,
+        scale_error_threshold=scale_error_threshold,
+        min_box_displacement_m=min_box_displacement_m,
+        box_expand_ratio=box_expand_ratio,
+    )
 
     merged = merge_depth_maps_in_ego0(
         predictions,
@@ -269,6 +319,7 @@ def run_render_pipeline(
         camera,
         [Path(path) for path in inference_paths],
         conf_percentile=conf_percentile,
+        point_filters=point_filters,
     )
     rendered_paths = render_all_camera_views(merged, frames, camera, output_dir / "renders")
 
@@ -296,25 +347,110 @@ def run_render_pipeline(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="VGGT AV2 inference, fusion, and render pipeline")
-    parser.add_argument("--data-root", type=Path, default=Path("argoverse2"))
-    parser.add_argument("--log-id", required=True)
-    parser.add_argument("--frame-start", type=int, required=True)
-    parser.add_argument("--frame-end", type=int, required=True)
-    parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--image-resolution", type=int, default=512)
-    parser.add_argument("--target-fps", type=float, default=10.0)
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument("--crop-bottom", type=int, default=DEFAULT_AV2_CROP_BOTTOM)
-    parser.add_argument("--crop-cache-dir", type=Path, default=None)
-    parser.add_argument("--sky-mask-cache-dir", type=Path, default=None)
-    parser.add_argument("--conf-percentile", type=float, default=0.0)
-    parser.add_argument("--no-metric-alignment", action="store_true")
-    parser.add_argument("--no-crop", action="store_true")
-    parser.add_argument("--no-comparison-gif", action="store_true")
-    parser.add_argument("--comparison-fps", type=float, default=None)
-    return parser.parse_args()
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument(
+        "--config",
+        type=Path,
+        default=DEFAULT_RENDER_PIPELINE_CONFIG,
+        help=f"YAML config with standard params (default: {DEFAULT_RENDER_PIPELINE_CONFIG})",
+    )
+    pre_args, remaining = pre_parser.parse_known_args()
+
+    defaults: dict = {}
+    if pre_args.config is not None:
+        if not pre_args.config.is_file():
+            raise FileNotFoundError(f"Pipeline config not found: {pre_args.config}")
+        defaults = {
+            key: value
+            for key, value in config_defaults(load_render_pipeline_config(pre_args.config)).items()
+            if value is not None
+        }
+
+    parser = argparse.ArgumentParser(
+        description="VGGT AV2 inference, fusion, and render pipeline",
+        parents=[pre_parser],
+    )
+    parser.add_argument("--data-root", type=Path, default=defaults.get("data_root", Path("argoverse2")))
+    parser.add_argument("--log-id", default=defaults.get("log_id"))
+    parser.add_argument("--frame-start", type=int, default=defaults.get("frame_start"))
+    parser.add_argument("--frame-end", type=int, default=defaults.get("frame_end"))
+    parser.add_argument("--checkpoint", type=Path, default=defaults.get("checkpoint"))
+    parser.add_argument("--output-dir", type=Path, default=defaults.get("output_dir"))
+    parser.add_argument("--image-resolution", type=int, default=defaults.get("image_resolution", 512))
+    parser.add_argument("--target-fps", type=float, default=defaults.get("target_fps", 10.0))
+    parser.add_argument("--device", default=defaults.get("device", "cuda"))
+    parser.add_argument(
+        "--crop-bottom",
+        type=int,
+        default=defaults.get("crop_bottom", DEFAULT_AV2_CROP_BOTTOM),
+    )
+    parser.add_argument("--crop-cache-dir", type=Path, default=defaults.get("crop_cache_dir"))
+    parser.add_argument("--sky-mask-cache-dir", type=Path, default=defaults.get("sky_mask_cache_dir"))
+    parser.add_argument("--conf-percentile", type=float, default=defaults.get("conf_percentile", 0.0))
+    parser.add_argument(
+        "--no-metric-alignment",
+        action="store_true",
+        default=defaults.get("no_metric_alignment", False),
+    )
+    parser.add_argument("--no-crop", action="store_true", default=defaults.get("no_crop", False))
+    parser.add_argument(
+        "--no-comparison-gif",
+        action="store_true",
+        default=defaults.get("no_comparison_gif", False),
+    )
+    parser.add_argument("--comparison-fps", type=float, default=defaults.get("comparison_fps"))
+    parser.add_argument(
+        "--no-dynamic-filter",
+        action="store_true",
+        default=defaults.get("no_dynamic_filter", False),
+    )
+    parser.add_argument(
+        "--dynamic-filter-mode",
+        choices=("combined", "sam2", "box"),
+        default=defaults.get("dynamic_filter_mode", "combined"),
+        help="combined=SAM for all + 3D box when scale ok (default), sam2, or box",
+    )
+    parser.add_argument(
+        "--scale-error-threshold",
+        type=float,
+        default=defaults.get("scale_error_threshold", DEFAULT_SCALE_ERROR_THRESHOLD),
+        help="Max median in-box LiDAR/pred depth error for extra 3D-box filtering",
+    )
+    parser.add_argument(
+        "--min-box-displacement-m",
+        type=float,
+        default=defaults.get("min_box_displacement_m", DEFAULT_MIN_BOX_DISPLACEMENT_M),
+        help="Min city-frame box displacement over the chunk to treat object as moving (default 0.2m)",
+    )
+    parser.add_argument(
+        "--box-filter-expand-ratio",
+        type=float,
+        default=defaults.get("box_filter_expand_ratio", DEFAULT_BOX_FILTER_EXPAND_RATIO),
+        help="Expand 3D/2D dynamic boxes by this factor for filtering (default 1.15)",
+    )
+    parser.add_argument(
+        "--sam2-model-id",
+        default=defaults.get("sam2_model_id", DEFAULT_SAM2_MODEL_ID),
+    )
+    parser.add_argument("--sam2-cache-dir", type=Path, default=defaults.get("sam2_cache_dir"))
+    parser.add_argument(
+        "--debug-dynamic-filter",
+        action=argparse.BooleanOptionalAction,
+        default=defaults.get("debug_dynamic_filter", False),
+    )
+
+    parser.parse_args(remaining, namespace=pre_args)
+    args = pre_args
+
+    required = ("log_id", "frame_start", "frame_end", "checkpoint", "output_dir")
+    missing = [name for name in required if getattr(args, name.replace("-", "_"), None) is None]
+    if missing:
+        parser.error(
+            "Missing required arguments: "
+            + ", ".join(f"--{name.replace('_', '-')}" for name in missing)
+            + f" (set them in {args.config} or pass on CLI)"
+        )
+    return args
 
 
 def main() -> None:
@@ -336,10 +472,20 @@ def main() -> None:
         align_metric=not args.no_metric_alignment,
         save_comparison=not args.no_comparison_gif,
         comparison_fps=args.comparison_fps,
+        filter_dynamic=not args.no_dynamic_filter,
+        dynamic_filter_mode=args.dynamic_filter_mode,
+        scale_error_threshold=args.scale_error_threshold,
+        min_box_displacement_m=args.min_box_displacement_m,
+        box_expand_ratio=args.box_filter_expand_ratio,
+        sam2_model_id=args.sam2_model_id,
+        sam2_cache_dir=args.sam2_cache_dir,
+        debug_dynamic_filter=args.debug_dynamic_filter,
     )
     print(f"Saved {len(rendered_paths)} renders to {args.output_dir / 'renders'}")
     if comparison_path is not None:
         print(f"Saved comparison GIF to {comparison_path}")
+    if args.debug_dynamic_filter:
+        print(f"Saved dynamic filter debug to {args.output_dir / 'dynamic_debug'}")
 
 
 if __name__ == "__main__":
