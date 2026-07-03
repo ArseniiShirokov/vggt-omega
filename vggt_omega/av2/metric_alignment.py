@@ -109,24 +109,16 @@ def project_lidar_to_depth_map(
     lidar_ego: np.ndarray,
 ) -> np.ndarray:
     """Rasterize LiDAR into a camera-frame depth map (closest z per pixel)."""
+    uv, keep = project_ego_points_to_uv(camera, lidar_ego)
+    if uv.size == 0:
+        return np.full((camera.height_px, camera.width_px), np.nan, dtype=np.float32)
+
     cam_SE3_ego = camera.ego_SE3_cam.inverse()
     points_cam = cam_SE3_ego.transform_point_cloud(lidar_ego)
+    z = points_cam[keep, 2]
+    uv_int = np.round(uv).astype(np.int32)
 
-    uv, points_cam, valid = camera.project_cam_to_img(points_cam)
-    uv = np.round(uv[valid]).astype(np.int32)
-    z = points_cam[valid, 2]
-
-    in_bounds = (
-        (uv[:, 0] >= 0)
-        & (uv[:, 0] < camera.width_px)
-        & (uv[:, 1] >= 0)
-        & (uv[:, 1] < camera.height_px)
-        & (z > 0)
-    )
-    uv = uv[in_bounds]
-    z = z[in_bounds]
-
-    lin_idx = uv[:, 1] * camera.width_px + uv[:, 0]
+    lin_idx = uv_int[:, 1] * camera.width_px + uv_int[:, 0]
     order = np.argsort(z)
     lin_idx = lin_idx[order]
     z = z[order]
@@ -135,6 +127,28 @@ def project_lidar_to_depth_map(
     depth = np.full((camera.height_px, camera.width_px), np.nan, dtype=np.float32)
     depth.ravel()[lin_idx[first]] = z[first]
     return depth
+
+
+def project_ego_points_to_uv(
+    camera: PinholeCamera,
+    points_ego: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Project ego-frame 3D points to image pixels visible in the camera."""
+    if len(points_ego) == 0:
+        return np.zeros((0, 2), dtype=np.float32), np.zeros(0, dtype=bool)
+
+    cam_SE3_ego = camera.ego_SE3_cam.inverse()
+    points_cam = cam_SE3_ego.transform_point_cloud(points_ego)
+    uv, points_cam, valid = camera.project_cam_to_img(points_cam)
+    keep = (
+        valid
+        & (points_cam[:, 2] > 0)
+        & (uv[:, 0] >= 0)
+        & (uv[:, 0] < camera.width_px)
+        & (uv[:, 1] >= 0)
+        & (uv[:, 1] < camera.height_px)
+    )
+    return uv[keep].astype(np.float32), keep
 
 
 def sample_depth_map_to_prediction_grid(
