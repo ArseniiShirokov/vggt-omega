@@ -8,10 +8,11 @@ import os
 
 import cv2
 import numpy as np
-import requests
 import trimesh
 from matplotlib import colormaps
 from scipy.spatial.transform import Rotation
+
+from vggt_omega.utils.sky_mask import download_file_from_url, segment_sky
 
 
 def predictions_to_glb(
@@ -230,48 +231,3 @@ def apply_sky_mask(conf: np.ndarray, target_dir: str) -> np.ndarray:
         masks.append(sky_mask)
 
     return conf * (np.array(masks) > 0.1).astype(np.float32)
-
-
-def segment_sky(image_path: str, onnx_session, mask_filename: str) -> np.ndarray:
-    image = cv2.imread(image_path)
-    result_map = run_skyseg(onnx_session, [320, 320], image)
-    result_map = cv2.resize(result_map, (image.shape[1], image.shape[0]))
-
-    output_mask = np.zeros_like(result_map)
-    output_mask[result_map < 32] = 255
-
-    os.makedirs(os.path.dirname(mask_filename), exist_ok=True)
-    cv2.imwrite(mask_filename, output_mask)
-    return output_mask
-
-
-def run_skyseg(onnx_session, input_size: list[int], image: np.ndarray) -> np.ndarray:
-    image = cv2.resize(image, dsize=(input_size[0], input_size[1]))
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    image = np.array(image, dtype=np.float32)
-    image = (image / 255 - [0.485, 0.456, 0.406]) / [0.229, 0.224, 0.225]
-    image = image.transpose(2, 0, 1)
-    image = image.reshape(-1, 3, input_size[0], input_size[1]).astype("float32")
-
-    input_name = onnx_session.get_inputs()[0].name
-    output_name = onnx_session.get_outputs()[0].name
-    result = onnx_session.run([output_name], {input_name: image})
-    result = np.array(result).squeeze()
-    result_min = np.min(result)
-    result_max = np.max(result)
-    if result_max > result_min:
-        result = (result - result_min) / (result_max - result_min)
-    else:
-        result = np.zeros_like(result)
-    return (result * 255).astype("uint8")
-
-
-def download_file_from_url(url: str, filename: str) -> None:
-    tmp_filename = f"{filename}.tmp"
-    response = requests.get(url, stream=True)
-    response.raise_for_status()
-
-    with open(tmp_filename, "wb") as f:
-        for chunk in response.iter_content(chunk_size=8192):
-            f.write(chunk)
-    os.replace(tmp_filename, filename)
