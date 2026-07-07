@@ -27,6 +27,14 @@ demo = [
     "requests",
     "onnxruntime",
 ]
+av2 = [
+    "av2",
+    "PyYAML",
+    "tqdm",
+]
+sam2 = [
+    "sam2",
+]
 export = [
     "pycolmap>=3.10.0",
 ]
