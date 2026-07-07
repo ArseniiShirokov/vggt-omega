@@ -190,6 +190,16 @@ class AV2SceneDataset:
     def __len__(self) -> int:
         return len(self._cam_paths)
 
+    def is_usable(self, index: int) -> bool:
+        """Frame has a matching LiDAR sweep."""
+        if index < 0 or index >= len(self):
+            return False
+        cam_timestamp_ns = int(self._cam_paths[index].stem)
+        return self._loader.get_closest_lidar_fpath(self.log_id, cam_timestamp_ns) is not None
+
+    def usable_indices(self, start: int, end: int) -> list[int]:
+        return [index for index in range(start, end + 1) if self.is_usable(index)]
+
     def __getitem__(self, index: int) -> AV2Frame:
         if index < 0 or index >= len(self):
             raise IndexError(f"Frame index {index} out of range for log {self.log_id}")

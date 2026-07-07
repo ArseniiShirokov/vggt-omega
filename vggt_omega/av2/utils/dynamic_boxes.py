@@ -122,6 +122,25 @@ def expand_xyxy(
     return clip_xyxy_to_image(cx - w * 0.5, cy - h * 0.5, cx + w * 0.5, cy + h * 0.5, width, height)
 
 
+DEFAULT_SAM2_2D_EXPAND_RATIO = 1.25
+
+
+def expand_xyxy_for_sam(
+    xyxy: np.ndarray,
+    width: int,
+    height: int,
+    *,
+    width_ratio: float = DEFAULT_SAM2_2D_EXPAND_RATIO,
+    bottom_ratio: float = DEFAULT_SAM2_2D_EXPAND_RATIO,
+) -> np.ndarray | None:
+    """Widen and extend the bottom of a projected 2D box (wheels sit below AV2 3D boxes)."""
+    x0, y0, x1, y1 = map(float, xyxy)
+    cx = (x0 + x1) * 0.5
+    w = (x1 - x0) * width_ratio
+    y1 = y1 + (y1 - y0) * (bottom_ratio - 1.0)
+    return clip_xyxy_to_image(cx - w * 0.5, y0, cx + w * 0.5, y1, width, height)
+
+
 def project_box_to_xyxy(
     box: AV2Box3D,
     camera: PinholeCamera,

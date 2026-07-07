@@ -38,6 +38,7 @@ __all__ = [
     "InsideDynamicBoxFilter",
     "SelectiveInsideDynamicBoxFilter",
     "apply_dynamic_filter_to_predictions",
+    "build_combined_point_filters",
 ]
 
 DynamicFilterMode = Literal["combined", "sam2", "box", "none"]
@@ -128,6 +129,43 @@ def build_combined_prompts(
     return prompts, tuple(boxes_3d)
 
 
+def build_combined_point_filters(
+    predictions: dict[str, np.ndarray],
+    frames: list[AV2Frame],
+    native_camera: PinholeCamera,
+    data_root: str | Path,
+    *,
+    moving_tracks: frozenset[str],
+    scale_error_threshold: float = DEFAULT_SCALE_ERROR_THRESHOLD,
+    box_expand_ratio: float = DEFAULT_BOX_FILTER_EXPAND_RATIO,
+    pred_height: int | None = None,
+    pred_width: int | None = None,
+) -> list[DepthPointFilter] | None:
+    """Build selective 3D in-box filters from chunk predictions (masks applied separately)."""
+    pred_height = pred_height or predictions["depth_conf"].shape[-2]
+    pred_width = pred_width or predictions["depth_conf"].shape[-1]
+    pred_camera = scale_pinhole_camera(native_camera, pred_width, pred_height)
+    loader = AV2SensorDataLoader(data_dir=Path(data_root), labels_dir=Path(data_root))
+
+    boxes_by_timestamp: dict[int, tuple[AV2Box3D, ...]] = {}
+    for index, frame in enumerate(frames):
+        boxes_3d: list[AV2Box3D] = []
+        for box, _ in project_dynamic_boxes_labeled(
+            frame, native_camera, moving_tracks=moving_tracks, expand_ratio=box_expand_ratio
+        ):
+            scale_error = box_depth_scale_error(
+                box, frame, loader, pred_camera, predictions["depth"][index]
+            )
+            if scale_error is not None and scale_error <= scale_error_threshold:
+                boxes_3d.append(box)
+        if boxes_3d:
+            boxes_by_timestamp[frame.cam_timestamp_ns] = tuple(boxes_3d)
+
+    if not boxes_by_timestamp:
+        return None
+    return [SelectiveInsideDynamicBoxFilter(boxes_by_timestamp, box_expand_ratio=box_expand_ratio)]
+
+
 def apply_dynamic_filter_to_predictions(
     predictions: dict[str, np.ndarray],
     frames: list[AV2Frame],
@@ -164,7 +202,14 @@ def apply_dynamic_filter_to_predictions(
                 debug_dir,
                 prompts_per_frame=[
                     [
-                        sam_prompt_for_box(frame, box, xyxy, native_camera, loader, use_3d_box=True)
+                        sam_prompt_for_box(
+                            frame,
+                            box,
+                            xyxy,
+                            native_camera,
+                            loader,
+                            use_3d_box=True,
+                        )
                         for box, xyxy in project_dynamic_boxes_labeled(
                             frame, native_camera, moving_tracks=moving_tracks, expand_ratio=box_expand_ratio
                         )
@@ -220,7 +265,14 @@ def apply_dynamic_filter_to_predictions(
                 boxes_by_timestamp[frame.cam_timestamp_ns] = boxes_3d
         else:
             prompts = [
-                sam_prompt_for_box(frame, box, xyxy, native_camera, loader, max_lidar_points=max_lidar_points)
+                sam_prompt_for_box(
+                    frame,
+                    box,
+                    xyxy,
+                    native_camera,
+                    loader,
+                    max_lidar_points=max_lidar_points,
+                )
                 for box, xyxy in project_dynamic_boxes_labeled(
                     frame, native_camera, moving_tracks=moving_tracks, expand_ratio=box_expand_ratio
                 )

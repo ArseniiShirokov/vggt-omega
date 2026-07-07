@@ -9,6 +9,7 @@ import numpy as np
 from av2.geometry.camera.pinhole_camera import PinholeCamera
 from av2.utils.io import read_img
 from PIL import Image
+from tqdm import tqdm
 
 from vggt_omega.av2.dataset import AV2SceneDataset, DEFAULT_AV2_CROP_BOTTOM
 from vggt_omega.av2.dynamic_filtering import (
@@ -16,10 +17,20 @@ from vggt_omega.av2.dynamic_filtering import (
     DEFAULT_MIN_BOX_DISPLACEMENT_M,
     DEFAULT_SCALE_ERROR_THRESHOLD,
     DepthPointFilter,
+    InsideDynamicBoxFilter,
     apply_dynamic_filter_to_predictions,
+    build_combined_point_filters,
 )
+from vggt_omega.av2.utils.lidar_prompts import DEFAULT_MAX_LIDAR_PROMPT_POINTS
 from vggt_omega.av2.utils.sam2_masks import DEFAULT_SAM2_MODEL_ID
 from vggt_omega.av2.inference import run_vggt_on_av2_chunk
+from vggt_omega.av2.scene_masks import (
+    SceneMaskCache,
+    apply_scene_masks_to_predictions,
+    precompute_scene_masks,
+    resolve_dynamic_mask_cache_dir,
+    resolve_scene_frame_range,
+)
 from vggt_omega.av2.pipeline_config import (
     DEFAULT_RENDER_PIPELINE_CONFIG,
     config_defaults,
@@ -119,11 +130,12 @@ def merge_depth_maps_in_ego0(
     )
 
 
-def render_points_in_camera(
+def splat_points_in_camera(
     camera: PinholeCamera,
     points_cam: np.ndarray,
     colors: np.ndarray,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
+    """Splat colored points into an image and a per-pixel depth (camera z, meters)."""
     image = np.zeros((camera.height_px, camera.width_px, 3), dtype=np.uint8)
     depth_buffer = np.full((camera.height_px, camera.width_px), np.inf, dtype=np.float32)
 
@@ -141,7 +153,28 @@ def render_points_in_camera(
             depth_buffer[v[idx], u[idx]] = z[idx]
             image[v[idx], u[idx]] = colors[idx]
 
+    depth_buffer[~np.isfinite(depth_buffer)] = np.nan
+    return image, depth_buffer
+
+
+def render_points_in_camera(
+    camera: PinholeCamera,
+    points_cam: np.ndarray,
+    colors: np.ndarray,
+) -> np.ndarray:
+    image, _ = splat_points_in_camera(camera, points_cam, colors)
     return image
+
+
+def save_rendered_depth_npz(depth: np.ndarray, output_path: Path) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(output_path, depth=depth.astype(np.float32))
+    return output_path
+
+
+def resolve_scene_output_dir(output_dir: str | Path, log_id: str) -> Path:
+    """Per-scene folder for rgb renders, depth npz, and video."""
+    return Path(output_dir) / "scenes" / log_id
 
 
 def load_gt_image(
@@ -228,11 +261,256 @@ def render_all_camera_views(
         points_ego = motion_compensate_ego(merged.points_ego0, frame_0.city_SE3_ego, frame.city_SE3_ego)
         points_cam = cam_SE3_ego.transform_point_cloud(points_ego)
         rendered = render_points_in_camera(camera, points_cam, merged.colors)
-        output_path = output_dir / f"{index:04d}_{frame.cam_timestamp_ns}.jpg"
+        output_path = output_dir / f"{index:04d}.jpg"
         cv2.imwrite(str(output_path), cv2.cvtColor(rendered, cv2.COLOR_RGB2BGR))
         rendered_paths.append(output_path)
 
     return rendered_paths
+
+
+def render_merged_at_frame(
+    merged: MergedPointCloud,
+    merge_frame_0,
+    render_frame,
+    camera: PinholeCamera,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Render merged cloud from the camera pose of render_frame (RGB + depth)."""
+    cam_SE3_ego = camera.ego_SE3_cam.inverse()
+    points_ego = motion_compensate_ego(
+        merged.points_ego0,
+        merge_frame_0.city_SE3_ego,
+        render_frame.city_SE3_ego,
+    )
+    points_cam = cam_SE3_ego.transform_point_cloud(points_ego)
+    return splat_points_in_camera(camera, points_cam, merged.colors)
+
+
+def save_render_video(
+    rendered_paths: list[Path],
+    output_path: Path,
+    *,
+    fps: float = 10.0,
+) -> Path:
+    if not rendered_paths:
+        raise ValueError("No renders to save into video")
+
+    first = cv2.imread(str(rendered_paths[0]), cv2.IMREAD_COLOR)
+    if first is None:
+        raise FileNotFoundError(f"Failed to read render image: {rendered_paths[0]}")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    writer = cv2.VideoWriter(
+        str(output_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        fps,
+        (first.shape[1], first.shape[0]),
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"Failed to open video writer: {output_path}")
+
+    try:
+        for path in rendered_paths:
+            frame = cv2.imread(str(path), cv2.IMREAD_COLOR)
+            if frame is None:
+                raise FileNotFoundError(f"Failed to read render image: {path}")
+            if frame.shape[:2] != first.shape[:2]:
+                frame = cv2.resize(frame, (first.shape[1], first.shape[0]), interpolation=cv2.INTER_AREA)
+            writer.write(frame)
+    finally:
+        writer.release()
+
+    return output_path
+
+
+def run_sliding_window_scene_pipeline(
+    data_root: str | Path,
+    log_id: str,
+    frame_start: int | None,
+    frame_end: int | None,
+    checkpoint_path: str | Path,
+    output_dir: str | Path,
+    *,
+    merge_frames: int = 8,
+    target_fps: float = 10.0,
+    image_resolution: int = 512,
+    preprocess_mode: str = "max_size",
+    device: str = "cuda",
+    crop_bottom_pixels: int = DEFAULT_AV2_CROP_BOTTOM,
+    crop_cache_dir: str | Path | None = None,
+    sky_mask_cache_dir: str | Path | None = None,
+    dynamic_mask_cache_dir: str | Path | None = None,
+    conf_percentile: float = 0.0,
+    align_metric: bool = True,
+    save_comparison: bool = True,
+    comparison_fps: float | None = None,
+    filter_dynamic: bool = True,
+    dynamic_filter_mode: str = "combined",
+    scale_error_threshold: float = DEFAULT_SCALE_ERROR_THRESHOLD,
+    min_box_displacement_m: float = DEFAULT_MIN_BOX_DISPLACEMENT_M,
+    box_expand_ratio: float = DEFAULT_BOX_FILTER_EXPAND_RATIO,
+    max_lidar_points: int = DEFAULT_MAX_LIDAR_PROMPT_POINTS,
+    sam2_model_id: str = DEFAULT_SAM2_MODEL_ID,
+    skip_mask_precompute: bool = False,
+) -> tuple[Path, list[Path], list[Path], Path | None, Path | None]:
+    """Process a full scene: precompute masks, then sliding-window merge+render."""
+    output_dir = Path(output_dir)
+    data_root = Path(data_root)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    scene = AV2SceneDataset(data_root, log_id, target_fps=target_fps)
+    usable_indices = resolve_scene_frame_range(scene, frame_start, frame_end)
+    scene_frames = [scene[index] for index in usable_indices]
+    scene_image_paths = [frame.image_path for frame in scene_frames]
+
+    if len(scene_frames) < merge_frames + 1:
+        raise ValueError(
+            f"Only {len(scene_frames)} usable frames; need at least {merge_frames + 1} for sliding window"
+        )
+
+    mask_cache: SceneMaskCache | None = None
+    if not skip_mask_precompute:
+        mask_cache = precompute_scene_masks(
+            data_root,
+            log_id,
+            scene_frames,
+            scene_image_paths,
+            crop_bottom=crop_bottom_pixels,
+            crop_cache_dir=crop_cache_dir,
+            sky_mask_cache_dir=sky_mask_cache_dir,
+            dynamic_mask_cache_dir=dynamic_mask_cache_dir,
+            min_box_displacement_m=min_box_displacement_m,
+            box_expand_ratio=box_expand_ratio,
+            max_lidar_points=max_lidar_points,
+            sam2_model_id=sam2_model_id,
+            device=device,
+            filter_dynamic=filter_dynamic and dynamic_filter_mode in ("combined", "sam2"),
+        )
+    elif filter_dynamic and dynamic_filter_mode in ("combined", "sam2"):
+        if sky_mask_cache_dir is None:
+            sky_mask_cache_dir = data_root / "cache" / log_id / "sky_masks"
+        from vggt_omega.av2.utils.motion import moving_track_uuids
+
+        mask_cache = SceneMaskCache(
+            sky_mask_cache_dir=Path(sky_mask_cache_dir),
+            dynamic_mask_cache_dir=resolve_dynamic_mask_cache_dir(
+                dynamic_mask_cache_dir, data_root, log_id
+            ),
+            moving_tracks=moving_track_uuids(scene_frames, min_displacement_m=min_box_displacement_m),
+        )
+
+    rendered_paths: list[Path] = []
+    depth_paths: list[Path] = []
+    render_image_paths: list[Path] = []
+    scene_dir = resolve_scene_output_dir(output_dir, log_id)
+    rgb_dir = scene_dir / "rgb"
+    depth_dir = scene_dir / "depth"
+    rgb_dir.mkdir(parents=True, exist_ok=True)
+    depth_dir.mkdir(parents=True, exist_ok=True)
+
+    window_idx = 0
+    for pos in tqdm(range(len(usable_indices) - merge_frames), desc="Sliding window"):
+        merge_indices = usable_indices[pos : pos + merge_frames]
+        if merge_indices[-1] - merge_indices[0] != merge_frames - 1:
+            continue
+
+        render_dataset_index = usable_indices[pos + merge_frames]
+        merge_start, merge_end = merge_indices[0], merge_indices[-1]
+
+        predictions, image_paths, inference_paths = run_vggt_on_av2_chunk(
+            data_root=data_root,
+            log_id=log_id,
+            frame_start=merge_start,
+            frame_end=merge_end,
+            checkpoint_path=checkpoint_path,
+            target_fps=target_fps,
+            image_resolution=image_resolution,
+            preprocess_mode=preprocess_mode,
+            device=device,
+            apply_sky_mask=False,
+            sky_mask_cache_dir=sky_mask_cache_dir,
+            crop_bottom_pixels=crop_bottom_pixels,
+            crop_cache_dir=crop_cache_dir,
+            align_metric=align_metric,
+        )
+
+        merge_frames_list = [scene[index] for index in merge_indices]
+        render_frame = scene[render_dataset_index]
+        pred_height, pred_width = predictions["depth"].shape[1:3]
+        camera = scale_pinhole_camera(
+            build_pinhole_camera(data_root, merge_frames_list[0], crop_bottom_pixels),
+            pred_width,
+            pred_height,
+        )
+
+        if mask_cache is not None:
+            predictions = apply_scene_masks_to_predictions(
+                predictions,
+                merge_frames_list,
+                image_paths,
+                inference_paths,
+                mask_cache,
+                crop_bottom=crop_bottom_pixels,
+                apply_sky=True,
+                apply_dynamic=filter_dynamic and dynamic_filter_mode in ("combined", "sam2"),
+            )
+
+        point_filters: list[DepthPointFilter] | None = None
+        if filter_dynamic:
+            if dynamic_filter_mode == "combined" and mask_cache is not None:
+                native_camera = build_pinhole_camera(data_root, merge_frames_list[0], crop_bottom_pixels)
+                point_filters = build_combined_point_filters(
+                    predictions,
+                    merge_frames_list,
+                    native_camera,
+                    data_root,
+                    moving_tracks=mask_cache.moving_tracks,
+                    scale_error_threshold=scale_error_threshold,
+                    box_expand_ratio=box_expand_ratio,
+                    pred_height=pred_height,
+                    pred_width=pred_width,
+                )
+            elif dynamic_filter_mode == "box" and mask_cache is not None:
+                point_filters = [
+                    InsideDynamicBoxFilter(mask_cache.moving_tracks, box_expand_ratio=box_expand_ratio)
+                ]
+
+        merged = merge_depth_maps_in_ego0(
+            predictions,
+            merge_frames_list,
+            camera,
+            [Path(path) for path in inference_paths],
+            conf_percentile=conf_percentile,
+            point_filters=point_filters,
+        )
+
+        rendered_rgb, rendered_depth = render_merged_at_frame(
+            merged, merge_frames_list[0], render_frame, camera
+        )
+        rgb_path = rgb_dir / f"{window_idx:04d}.jpg"
+        depth_path = depth_dir / f"{window_idx:04d}.npz"
+        cv2.imwrite(str(rgb_path), cv2.cvtColor(rendered_rgb, cv2.COLOR_RGB2BGR))
+        save_rendered_depth_npz(rendered_depth, depth_path)
+        rendered_paths.append(rgb_path)
+        depth_paths.append(depth_path)
+        render_image_paths.append(render_frame.image_path)
+        window_idx += 1
+
+    video_fps = target_fps if comparison_fps is None else comparison_fps
+    video_path = save_render_video(rendered_paths, scene_dir / "scene_render.mp4", fps=video_fps)
+
+    comparison_path: Path | None = None
+    if save_comparison:
+        comparison_path = save_comparison_gif(
+            render_image_paths,
+            rendered_paths,
+            scene_dir / "comparison.gif",
+            crop_bottom=crop_bottom_pixels,
+            width=camera.width_px,
+            height=camera.height_px,
+            fps=video_fps,
+        )
+
+    return scene_dir, rendered_paths, depth_paths, video_path, comparison_path
 
 
 def run_render_pipeline(
@@ -305,7 +583,7 @@ def run_render_pipeline(
         sam2_model_id=sam2_model_id,
         device=device,
         sam2_cache_dir=sam2_cache_dir,
-        debug_dir=(output_dir / "dynamic_debug") if debug_dynamic_filter else None,
+        debug_dir=(output_dir / log_id / "dynamic_debug") if debug_dynamic_filter else None,
         pred_height=pred_height,
         pred_width=pred_width,
         scale_error_threshold=scale_error_threshold,
@@ -321,22 +599,22 @@ def run_render_pipeline(
         conf_percentile=conf_percentile,
         point_filters=point_filters,
     )
-    rendered_paths = render_all_camera_views(merged, frames, camera, output_dir / "renders")
+    rendered_paths = render_all_camera_views(merged, frames, camera, output_dir / log_id)
 
     np.savez(
-        output_dir / "merged_pointcloud.npz",
+        output_dir / log_id / "merged_pointcloud.npz",
         points_ego0=merged.points_ego0,
         points_cam0=merged.points_cam0,
         colors=merged.colors,
     )
-    np.savez(output_dir / "predictions.npz", **predictions)
+    np.savez(output_dir / log_id / "predictions.npz", **predictions)
 
     comparison_path: Path | None = None
     if save_comparison:
         comparison_path = save_comparison_gif(
             [Path(path) for path in image_paths],
             rendered_paths,
-            output_dir / "comparison.gif",
+            output_dir / log_id / "comparison.gif",
             crop_bottom=crop_bottom_pixels,
             width=camera.width_px,
             height=camera.height_px,
@@ -429,6 +707,12 @@ def parse_args() -> argparse.Namespace:
         help="Expand 3D/2D dynamic boxes by this factor for filtering (default 1.15)",
     )
     parser.add_argument(
+        "--max-lidar-prompt-points",
+        type=int,
+        default=defaults.get("max_lidar_prompt_points", DEFAULT_MAX_LIDAR_PROMPT_POINTS),
+        help="Max LiDAR points per SAM prompt (default 12)",
+    )
+    parser.add_argument(
         "--sam2-model-id",
         default=defaults.get("sam2_model_id", DEFAULT_SAM2_MODEL_ID),
     )
@@ -438,11 +722,38 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=defaults.get("debug_dynamic_filter", False),
     )
+    parser.add_argument(
+        "--sliding-window",
+        action=argparse.BooleanOptionalAction,
+        default=defaults.get("sliding_window", False),
+        help="Process full scene with sliding window (precompute masks, then merge+render)",
+    )
+    parser.add_argument(
+        "--merge-frames",
+        type=int,
+        default=defaults.get("merge_frames", 8),
+        help="Number of frames to fuse per window (render uses pose of the next frame)",
+    )
+    parser.add_argument(
+        "--dynamic-mask-cache-dir",
+        type=Path,
+        default=defaults.get("dynamic_mask_cache_dir"),
+        help="Directory for precomputed per-frame dynamic SAM masks",
+    )
+    parser.add_argument(
+        "--skip-mask-precompute",
+        action=argparse.BooleanOptionalAction,
+        default=defaults.get("skip_mask_precompute", False),
+        help="Reuse existing cached scene masks without recomputing",
+    )
 
     parser.parse_args(remaining, namespace=pre_args)
     args = pre_args
 
-    required = ("log_id", "frame_start", "frame_end", "checkpoint", "output_dir")
+    if args.sliding_window:
+        required = ("log_id", "checkpoint", "output_dir")
+    else:
+        required = ("log_id", "frame_start", "frame_end", "checkpoint", "output_dir")
     missing = [name for name in required if getattr(args, name.replace("-", "_"), None) is None]
     if missing:
         parser.error(
@@ -455,6 +766,47 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    crop_bottom = 0 if args.no_crop else args.crop_bottom
+    dynamic_mask_cache_dir = args.dynamic_mask_cache_dir or args.sam2_cache_dir
+
+    if args.sliding_window:
+        scene_dir, rendered_paths, depth_paths, video_path, comparison_path = run_sliding_window_scene_pipeline(
+            data_root=args.data_root,
+            log_id=args.log_id,
+            frame_start=args.frame_start,
+            frame_end=args.frame_end,
+            checkpoint_path=args.checkpoint,
+            output_dir=args.output_dir,
+            merge_frames=args.merge_frames,
+            target_fps=args.target_fps,
+            image_resolution=args.image_resolution,
+            device=args.device,
+            crop_bottom_pixels=crop_bottom,
+            crop_cache_dir=args.crop_cache_dir,
+            sky_mask_cache_dir=args.sky_mask_cache_dir,
+            dynamic_mask_cache_dir=dynamic_mask_cache_dir,
+            conf_percentile=args.conf_percentile,
+            align_metric=not args.no_metric_alignment,
+            save_comparison=not args.no_comparison_gif,
+            comparison_fps=args.comparison_fps,
+            filter_dynamic=not args.no_dynamic_filter,
+            dynamic_filter_mode=args.dynamic_filter_mode,
+            scale_error_threshold=args.scale_error_threshold,
+            min_box_displacement_m=args.min_box_displacement_m,
+            box_expand_ratio=args.box_filter_expand_ratio,
+            max_lidar_points=args.max_lidar_prompt_points,
+            sam2_model_id=args.sam2_model_id,
+            skip_mask_precompute=args.skip_mask_precompute,
+        )
+        print(f"Saved scene outputs to {scene_dir}")
+        print(f"  rgb:   {len(rendered_paths)} frames in {scene_dir / 'rgb'}")
+        print(f"  depth: {len(depth_paths)} npz files in {scene_dir / 'depth'}")
+        if video_path is not None:
+            print(f"  video: {video_path}")
+        if comparison_path is not None:
+            print(f"  comparison: {comparison_path}")
+        return
+
     _, rendered_paths, comparison_path = run_render_pipeline(
         data_root=args.data_root,
         log_id=args.log_id,
@@ -481,11 +833,11 @@ def main() -> None:
         sam2_cache_dir=args.sam2_cache_dir,
         debug_dynamic_filter=args.debug_dynamic_filter,
     )
-    print(f"Saved {len(rendered_paths)} renders to {args.output_dir / 'renders'}")
+    print(f"Saved {len(rendered_paths)} renders to {args.output_dir / args.log_id}")
     if comparison_path is not None:
         print(f"Saved comparison GIF to {comparison_path}")
     if args.debug_dynamic_filter:
-        print(f"Saved dynamic filter debug to {args.output_dir / 'dynamic_debug'}")
+        print(f"Saved dynamic filter debug to {args.output_dir / args.log_id / 'dynamic_debug'}")
 
 
 if __name__ == "__main__":

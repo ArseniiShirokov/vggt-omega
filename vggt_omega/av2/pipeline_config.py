@@ -30,6 +30,16 @@ def _flatten_scene(raw: dict[str, Any]) -> dict[str, Any]:
         for key in ("log_id", "frame_start", "frame_end"):
             if key in scene:
                 flat[key] = scene[key]
+
+    sliding = flat.pop("sliding_window", None)
+    if sliding is not None:
+        if not isinstance(sliding, dict):
+            raise ValueError("'sliding_window' section must be a mapping")
+        if "enabled" in sliding:
+            flat["sliding_window"] = sliding["enabled"]
+        if "merge_frames" in sliding:
+            flat["merge_frames"] = sliding["merge_frames"]
+
     return flat
 
 
@@ -58,7 +68,12 @@ def config_defaults(config: dict[str, Any]) -> dict[str, Any]:
         "scale_error_threshold": config.get("scale_error_threshold"),
         "min_box_displacement_m": config.get("min_box_displacement_m"),
         "box_filter_expand_ratio": config.get("box_filter_expand_ratio"),
+        "max_lidar_prompt_points": config.get("max_lidar_prompt_points"),
         "sam2_model_id": config.get("sam2_model_id"),
         "sam2_cache_dir": config.get("sam2_cache_dir"),
+        "dynamic_mask_cache_dir": config.get("dynamic_mask_cache_dir") or config.get("sam2_cache_dir"),
         "debug_dynamic_filter": config.get("debug_dynamic_filter", False),
+        "sliding_window": config.get("sliding_window", False),
+        "merge_frames": config.get("merge_frames", 8),
+        "skip_mask_precompute": config.get("skip_mask_precompute", False),
     }

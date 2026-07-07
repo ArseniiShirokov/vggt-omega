@@ -12,7 +12,7 @@ from vggt_omega.av2.dataset import AV2Box3D, AV2Frame, AV2SceneDataset
 from vggt_omega.av2.metric_alignment import motion_compensate_lidar_to_camera_time, project_ego_points_to_uv
 from vggt_omega.av2.utils.dynamic_boxes import points_inside_box, project_dynamic_boxes_labeled
 
-DEFAULT_MAX_LIDAR_PROMPT_POINTS = 32
+DEFAULT_MAX_LIDAR_PROMPT_POINTS = 12
 
 
 @dataclass(frozen=True)
@@ -62,8 +62,17 @@ def sam_prompt_for_box(
     scale_error: float | None = None,
     use_3d_box: bool = False,
 ) -> DynamicObjectSamPrompt:
+    # Unexpanded 3D box: expanded boxes pick up road points and SAM segments background.
     lidar_ego = lidar_points_in_box_ego(frame, box, loader, expand_ratio=1.0)
     lidar_uv, _ = project_ego_points_to_uv(camera, lidar_ego)
+    x0, y0, x1, y1 = xyxy
+    in_2d_box = (
+        (lidar_uv[:, 0] >= x0)
+        & (lidar_uv[:, 0] <= x1)
+        & (lidar_uv[:, 1] >= y0)
+        & (lidar_uv[:, 1] <= y1)
+    )
+    lidar_uv = lidar_uv[in_2d_box]
     lidar_uv = subsample_uv_points(lidar_uv, max_lidar_points, seed=hash(box.track_uuid) % (2**32))
     return DynamicObjectSamPrompt(
         box=box,
