@@ -38,4 +38,4 @@ box_filter_expand_ratio: 1.10
 max_lidar_prompt_points: 24
 sam2_model_id: facebook/sam2.1-hiera-large
 dynamic_mask_cache_dir: outputs/render_waymo/dynamic_masks
-debug_dynamic_filter: true
+debug_dynamic_filter: false 
