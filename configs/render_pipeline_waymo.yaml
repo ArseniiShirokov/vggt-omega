@@ -1,0 +1,41 @@
+# Per-run scene and chunk interval (change these between runs).
+scene:
+  scene_id: "10017090168044687777_6380_000_6400_000"
+  frame_start: 0
+  frame_end: null  # null = all frames in the scene
+
+# Sliding window: merge N frames, render from pose of frame N+1.
+sliding_window:
+  enabled: true
+  merge_frames: 8
+
+# Standard pipeline parameters.
+data_root: /home/jovyan/datasets/self-driving/waymo/waymo_open_dataset_v_2_0_1
+split: training
+checkpoint: /home/jovyan/users/shirokov/thirdparty/vggt-omega/weights/vggt_omega_1b_512.pt
+output_dir: outputs/render_waymo
+
+image_resolution: 512
+target_fps: 10.0
+device: cuda
+crop_bottom: 0
+
+crop_cache_dir: null
+sky_mask_cache_dir: outputs/sky_masks_waymo
+image_cache_dir: null
+skip_mask_precompute: false
+
+conf_percentile: 0.0
+align_metric: true
+save_comparison: true
+comparison_fps: null
+
+dynamic_filter: true
+dynamic_filter_mode: combined
+scale_error_threshold: 0.12
+min_box_displacement_m: 0.5
+box_filter_expand_ratio: 1.10
+max_lidar_prompt_points: 24
+sam2_model_id: facebook/sam2.1-hiera-large
+dynamic_mask_cache_dir: outputs/render_waymo/dynamic_masks
+debug_dynamic_filter: true

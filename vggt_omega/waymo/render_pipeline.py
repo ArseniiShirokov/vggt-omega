@@ -6,13 +6,13 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from av2.geometry.camera.pinhole_camera import PinholeCamera
-from av2.utils.io import read_img
 from PIL import Image
 from tqdm import tqdm
 
-from vggt_omega.av2.dataset import AV2SceneDataset, DEFAULT_AV2_CROP_BOTTOM
-from vggt_omega.av2.dynamic_filtering import (
+from vggt_omega.rendering.zbuffer import render_points_in_camera, splat_points_in_camera
+from vggt_omega.waymo.dataset import DEFAULT_WAYMO_CROP_BOTTOM, WaymoSceneDataset
+from vggt_omega.waymo.types import WaymoFrame
+from vggt_omega.waymo.dynamic_filtering import (
     DEFAULT_BOX_FILTER_EXPAND_RATIO,
     DEFAULT_MIN_BOX_DISPLACEMENT_M,
     DEFAULT_SCALE_ERROR_THRESHOLD,
@@ -21,28 +21,28 @@ from vggt_omega.av2.dynamic_filtering import (
     apply_dynamic_filter_to_predictions,
     build_combined_point_filters,
 )
-from vggt_omega.av2.utils.lidar_prompts import DEFAULT_MAX_LIDAR_PROMPT_POINTS
-from vggt_omega.av2.utils.sam2_masks import DEFAULT_SAM2_MODEL_ID
-from vggt_omega.av2.inference import run_vggt_on_av2_chunk
-from vggt_omega.av2.scene_masks import (
+from vggt_omega.waymo.inference import run_vggt_on_waymo_chunk
+from vggt_omega.waymo.metric_alignment import (
+    build_pinhole_camera,
+    depth_to_cam_points,
+    motion_compensate_ego,
+    scale_pinhole_camera,
+)
+from vggt_omega.waymo.pipeline_config import (
+    DEFAULT_RENDER_PIPELINE_CONFIG,
+    config_defaults,
+    load_render_pipeline_config,
+)
+from vggt_omega.waymo.scene_masks import (
     SceneMaskCache,
     apply_scene_masks_to_predictions,
     precompute_scene_masks,
     resolve_dynamic_mask_cache_dir,
     resolve_scene_frame_range,
 )
-from vggt_omega.av2.pipeline_config import (
-    DEFAULT_RENDER_PIPELINE_CONFIG,
-    config_defaults,
-    load_render_pipeline_config,
-)
-from vggt_omega.av2.metric_alignment import (
-    build_pinhole_camera,
-    depth_to_cam_points,
-    motion_compensate_ego,
-    scale_pinhole_camera,
-)
-from vggt_omega.rendering.zbuffer import render_points_in_camera, splat_points_in_camera
+from vggt_omega.waymo.utils.lidar_prompts import DEFAULT_MAX_LIDAR_PROMPT_POINTS
+from vggt_omega.waymo.utils.motion import moving_track_ids
+from vggt_omega.av2.utils.sam2_masks import DEFAULT_SAM2_MODEL_ID
 
 
 @dataclass
@@ -61,7 +61,10 @@ def sample_image_colors(
     camera_width: int,
     camera_height: int,
 ) -> np.ndarray:
-    image = read_img(image_path, channel_order="RGB")
+    image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    if image is None:
+        raise FileNotFoundError(f"Failed to read image: {image_path}")
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     height, width = image.shape[:2]
     u = np.clip(np.round(uv[:, 0] * width / camera_width).astype(np.int32), 0, width - 1)
     v = np.clip(np.round(uv[:, 1] * height / camera_height).astype(np.int32), 0, height - 1)
@@ -70,8 +73,8 @@ def sample_image_colors(
 
 def merge_depth_maps_in_ego0(
     predictions: dict[str, np.ndarray],
-    frames: list,
-    camera: PinholeCamera,
+    frames: list[WaymoFrame],
+    camera,
     color_image_paths: list[Path],
     *,
     conf_percentile: float = 0.0,
@@ -108,8 +111,7 @@ def merge_depth_maps_in_ego0(
                 keep_ego &= point_filter.keep(points_ego, frame)
             points_ego = points_ego[keep_ego]
             uv = uv[keep_ego]
-
-        points_ego0 = motion_compensate_ego(points_ego, frame.city_SE3_ego, frame_0.city_SE3_ego)
+        points_ego0 = motion_compensate_ego(points_ego, frame.world_SE3_ego, frame_0.world_SE3_ego)
 
         all_points_ego0.append(points_ego0)
         all_colors.append(
@@ -137,9 +139,8 @@ def save_rendered_depth_npz(depth: np.ndarray, output_path: Path) -> Path:
     return output_path
 
 
-def resolve_scene_output_dir(output_dir: str | Path, log_id: str) -> Path:
-    """Per-scene folder for rgb renders, depth npz, and video."""
-    return Path(output_dir) / "scenes" / log_id
+def resolve_scene_output_dir(output_dir: str | Path, scene_id: str) -> Path:
+    return Path(output_dir) / "scenes" / scene_id
 
 
 def load_gt_image(
@@ -149,8 +150,10 @@ def load_gt_image(
     width: int,
     height: int,
 ) -> np.ndarray:
-    """Load a GT camera frame cropped and resized to the render resolution."""
-    image = read_img(image_path, channel_order="RGB")
+    image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    if image is None:
+        raise FileNotFoundError(f"Failed to read image: {image_path}")
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     if crop_bottom > 0:
         image = image[: image.shape[0] - crop_bottom]
     if image.shape[1] != width or image.shape[0] != height:
@@ -165,7 +168,6 @@ def stitch_gt_render_comparison(
     gt_label: str = "GT",
     render_label: str = "Render",
 ) -> np.ndarray:
-    """Place GT and render side by side with a divider and labels."""
     divider = np.full((gt_rgb.shape[0], 2, 3), 64, dtype=np.uint8)
     combined = np.concatenate([gt_rgb, divider, render_rgb], axis=1)
 
@@ -186,7 +188,6 @@ def save_comparison_gif(
     height: int,
     fps: float = 10.0,
 ) -> Path:
-    """Build a side-by-side GT vs render GIF."""
     if len(gt_image_paths) != len(rendered_paths):
         raise ValueError("GT and render frame counts must match")
 
@@ -213,8 +214,8 @@ def save_comparison_gif(
 
 def render_all_camera_views(
     merged: MergedPointCloud,
-    frames: list,
-    camera: PinholeCamera,
+    frames: list[WaymoFrame],
+    camera,
     output_dir: Path,
 ) -> list[Path]:
     frame_0 = frames[0]
@@ -223,7 +224,7 @@ def render_all_camera_views(
     rendered_paths: list[Path] = []
 
     for index, frame in enumerate(frames):
-        points_ego = motion_compensate_ego(merged.points_ego0, frame_0.city_SE3_ego, frame.city_SE3_ego)
+        points_ego = motion_compensate_ego(merged.points_ego0, frame_0.world_SE3_ego, frame.world_SE3_ego)
         points_cam = cam_SE3_ego.transform_point_cloud(points_ego)
         rendered = render_points_in_camera(camera, points_cam, merged.colors)
         output_path = output_dir / f"{index:04d}.jpg"
@@ -235,16 +236,15 @@ def render_all_camera_views(
 
 def render_merged_at_frame(
     merged: MergedPointCloud,
-    merge_frame_0,
-    render_frame,
-    camera: PinholeCamera,
+    merge_frame_0: WaymoFrame,
+    render_frame: WaymoFrame,
+    camera,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Render merged cloud from the camera pose of render_frame (RGB + depth)."""
     cam_SE3_ego = camera.ego_SE3_cam.inverse()
     points_ego = motion_compensate_ego(
         merged.points_ego0,
-        merge_frame_0.city_SE3_ego,
-        render_frame.city_SE3_ego,
+        merge_frame_0.world_SE3_ego,
+        render_frame.world_SE3_ego,
     )
     points_cam = cam_SE3_ego.transform_point_cloud(points_ego)
     return splat_points_in_camera(camera, points_cam, merged.colors)
@@ -289,21 +289,22 @@ def save_render_video(
 
 def run_sliding_window_scene_pipeline(
     data_root: str | Path,
-    log_id: str,
+    scene_id: str,
     frame_start: int | None,
     frame_end: int | None,
     checkpoint_path: str | Path,
     output_dir: str | Path,
     *,
+    split: str = "training",
     merge_frames: int = 8,
     target_fps: float = 10.0,
     image_resolution: int = 512,
     preprocess_mode: str = "max_size",
     device: str = "cuda",
-    crop_bottom_pixels: int = DEFAULT_AV2_CROP_BOTTOM,
+    crop_bottom_pixels: int = DEFAULT_WAYMO_CROP_BOTTOM,
     crop_cache_dir: str | Path | None = None,
     sky_mask_cache_dir: str | Path | None = None,
-    dynamic_mask_cache_dir: str | Path | None = None,
+    image_cache_dir: str | Path | None = None,
     conf_percentile: float = 0.0,
     align_metric: bool = True,
     save_comparison: bool = True,
@@ -315,30 +316,41 @@ def run_sliding_window_scene_pipeline(
     box_expand_ratio: float = DEFAULT_BOX_FILTER_EXPAND_RATIO,
     max_lidar_points: int = DEFAULT_MAX_LIDAR_PROMPT_POINTS,
     sam2_model_id: str = DEFAULT_SAM2_MODEL_ID,
+    dynamic_mask_cache_dir: str | Path | None = None,
     skip_mask_precompute: bool = False,
+    debug_dynamic_filter: bool = False,
 ) -> tuple[Path, list[Path], list[Path], Path | None, Path | None]:
-    """Process a full scene: precompute masks, then sliding-window merge+render."""
     output_dir = Path(output_dir)
     data_root = Path(data_root)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    scene = AV2SceneDataset(data_root, log_id, target_fps=target_fps)
+    scene = WaymoSceneDataset(
+        data_root,
+        scene_id,
+        split=split,
+        target_fps=target_fps,
+        image_cache_dir=image_cache_dir,
+    )
     usable_indices = resolve_scene_frame_range(scene, frame_start, frame_end)
-    scene_frames = [scene[index] for index in usable_indices]
-    scene_image_paths = [frame.image_path for frame in scene_frames]
+    scene_image_paths = [scene.image_path_at(index) for index in usable_indices]
 
-    if len(scene_frames) < merge_frames + 1:
+    if len(usable_indices) < merge_frames + 1:
         raise ValueError(
-            f"Only {len(scene_frames)} usable frames; need at least {merge_frames + 1} for sliding window"
+            f"Only {len(usable_indices)} usable frames; need at least {merge_frames + 1} for sliding window"
         )
+
+    scene_dir = resolve_scene_output_dir(output_dir, scene_id)
+    debug_dir = scene_dir / "dynamic_debug" if debug_dynamic_filter else None
 
     mask_cache: SceneMaskCache | None = None
     if not skip_mask_precompute:
         mask_cache = precompute_scene_masks(
             data_root,
-            log_id,
-            scene_frames,
+            scene_id,
+            scene,
+            usable_indices,
             scene_image_paths,
+            split=split,
             crop_bottom=crop_bottom_pixels,
             crop_cache_dir=crop_cache_dir,
             sky_mask_cache_dir=sky_mask_cache_dir,
@@ -349,30 +361,32 @@ def run_sliding_window_scene_pipeline(
             sam2_model_id=sam2_model_id,
             device=device,
             filter_dynamic=filter_dynamic and dynamic_filter_mode in ("combined", "sam2"),
+            debug_dir=debug_dir,
+            pred_height=image_resolution,
+            pred_width=image_resolution,
         )
     elif filter_dynamic and dynamic_filter_mode in ("combined", "sam2"):
         if sky_mask_cache_dir is None:
-            sky_mask_cache_dir = data_root / "cache" / log_id / "sky_masks"
-        from vggt_omega.av2.utils.motion import moving_track_uuids
-
+            sky_mask_cache_dir = data_root / split / "cache" / scene_id / "sky_masks"
+        metadata_frames = [scene.get_frame(index, load_lidar=False) for index in usable_indices]
         mask_cache = SceneMaskCache(
-            sky_mask_cache_dir=Path(sky_mask_cache_dir),
+            sky_mask_cache_dir=Path(sky_mask_cache_dir) / scene_id,
             dynamic_mask_cache_dir=resolve_dynamic_mask_cache_dir(
-                dynamic_mask_cache_dir, data_root, log_id
+                dynamic_mask_cache_dir, data_root, split, scene_id
             ),
-            moving_tracks=moving_track_uuids(scene_frames, min_displacement_m=min_box_displacement_m),
+            moving_tracks=moving_track_ids(metadata_frames, min_displacement_m=min_box_displacement_m),
         )
 
     rendered_paths: list[Path] = []
     depth_paths: list[Path] = []
     render_image_paths: list[Path] = []
-    scene_dir = resolve_scene_output_dir(output_dir, log_id)
     rgb_dir = scene_dir / "rgb"
     depth_dir = scene_dir / "depth"
     rgb_dir.mkdir(parents=True, exist_ok=True)
     depth_dir.mkdir(parents=True, exist_ok=True)
 
     window_idx = 0
+    camera = None
     for pos in tqdm(range(len(usable_indices) - merge_frames), desc="Sliding window"):
         merge_indices = usable_indices[pos : pos + merge_frames]
         if merge_indices[-1] - merge_indices[0] != merge_frames - 1:
@@ -381,28 +395,29 @@ def run_sliding_window_scene_pipeline(
         render_dataset_index = usable_indices[pos + merge_frames]
         merge_start, merge_end = merge_indices[0], merge_indices[-1]
 
-        predictions, image_paths, inference_paths = run_vggt_on_av2_chunk(
+        predictions, image_paths, inference_paths = run_vggt_on_waymo_chunk(
             data_root=data_root,
-            log_id=log_id,
+            scene_id=scene_id,
             frame_start=merge_start,
             frame_end=merge_end,
             checkpoint_path=checkpoint_path,
+            split=split,
             target_fps=target_fps,
             image_resolution=image_resolution,
             preprocess_mode=preprocess_mode,
             device=device,
             apply_sky_mask=False,
-            sky_mask_cache_dir=sky_mask_cache_dir,
             crop_bottom_pixels=crop_bottom_pixels,
             crop_cache_dir=crop_cache_dir,
             align_metric=align_metric,
+            image_cache_dir=image_cache_dir,
         )
 
         merge_frames_list = [scene[index] for index in merge_indices]
         render_frame = scene[render_dataset_index]
         pred_height, pred_width = predictions["depth"].shape[1:3]
         camera = scale_pinhole_camera(
-            build_pinhole_camera(data_root, merge_frames_list[0], crop_bottom_pixels),
+            build_pinhole_camera(merge_frames_list[0], crop_bottom_pixels),
             pred_width,
             pred_height,
         )
@@ -422,12 +437,11 @@ def run_sliding_window_scene_pipeline(
         point_filters: list[DepthPointFilter] | None = None
         if filter_dynamic:
             if dynamic_filter_mode == "combined" and mask_cache is not None:
-                native_camera = build_pinhole_camera(data_root, merge_frames_list[0], crop_bottom_pixels)
+                native_camera = build_pinhole_camera(merge_frames_list[0], crop_bottom_pixels)
                 point_filters = build_combined_point_filters(
                     predictions,
                     merge_frames_list,
                     native_camera,
-                    data_root,
                     moving_tracks=mask_cache.moving_tracks,
                     scale_error_threshold=scale_error_threshold,
                     box_expand_ratio=box_expand_ratio,
@@ -464,7 +478,7 @@ def run_sliding_window_scene_pipeline(
     video_path = save_render_video(rendered_paths, scene_dir / "scene_render.mp4", fps=video_fps)
 
     comparison_path: Path | None = None
-    if save_comparison:
+    if save_comparison and camera is not None:
         comparison_path = save_comparison_gif(
             render_image_paths,
             rendered_paths,
@@ -480,19 +494,21 @@ def run_sliding_window_scene_pipeline(
 
 def run_render_pipeline(
     data_root: str | Path,
-    log_id: str,
+    scene_id: str,
     frame_start: int,
     frame_end: int,
     checkpoint_path: str | Path,
     output_dir: str | Path,
     *,
+    split: str = "training",
     target_fps: float = 10.0,
     image_resolution: int = 512,
     preprocess_mode: str = "max_size",
     device: str = "cuda",
-    crop_bottom_pixels: int = DEFAULT_AV2_CROP_BOTTOM,
+    crop_bottom_pixels: int = DEFAULT_WAYMO_CROP_BOTTOM,
     crop_cache_dir: str | Path | None = None,
     sky_mask_cache_dir: str | Path | None = None,
+    image_cache_dir: str | Path | None = None,
     conf_percentile: float = 0.0,
     align_metric: bool = True,
     save_comparison: bool = True,
@@ -509,12 +525,13 @@ def run_render_pipeline(
     output_dir = Path(output_dir)
     data_root = Path(data_root)
 
-    predictions, image_paths, inference_paths = run_vggt_on_av2_chunk(
+    predictions, image_paths, inference_paths = run_vggt_on_waymo_chunk(
         data_root=data_root,
-        log_id=log_id,
+        scene_id=scene_id,
         frame_start=frame_start,
         frame_end=frame_end,
         checkpoint_path=checkpoint_path,
+        split=split,
         target_fps=target_fps,
         image_resolution=image_resolution,
         preprocess_mode=preprocess_mode,
@@ -524,36 +541,43 @@ def run_render_pipeline(
         crop_bottom_pixels=crop_bottom_pixels,
         crop_cache_dir=crop_cache_dir,
         align_metric=align_metric,
+        image_cache_dir=image_cache_dir,
     )
 
-    scene = AV2SceneDataset(data_root, log_id, target_fps=target_fps)
+    scene = WaymoSceneDataset(
+        data_root,
+        scene_id,
+        split=split,
+        target_fps=target_fps,
+        image_cache_dir=image_cache_dir,
+    )
     frames = [scene[index] for index in range(frame_start, frame_end + 1)]
     pred_height, pred_width = predictions["depth"].shape[1:3]
     camera = scale_pinhole_camera(
-        build_pinhole_camera(data_root, frames[0], crop_bottom_pixels),
+        build_pinhole_camera(frames[0], crop_bottom_pixels),
         pred_width,
         pred_height,
     )
-    native_camera = build_pinhole_camera(data_root, frames[0], crop_bottom_pixels)
+    native_camera = build_pinhole_camera(frames[0], crop_bottom_pixels)
 
     dynamic_mode = "none" if not filter_dynamic else dynamic_filter_mode
+    debug_dir = (output_dir / scene_id / "dynamic_debug") if debug_dynamic_filter else None
     predictions, point_filters = apply_dynamic_filter_to_predictions(
         predictions,
         frames,
         image_paths,
         native_camera,
-        data_root,
         mode=dynamic_mode,
         crop_bottom=crop_bottom_pixels,
         sam2_model_id=sam2_model_id,
         device=device,
         sam2_cache_dir=sam2_cache_dir,
-        debug_dir=(output_dir / log_id / "dynamic_debug") if debug_dynamic_filter else None,
         pred_height=pred_height,
         pred_width=pred_width,
         scale_error_threshold=scale_error_threshold,
         min_box_displacement_m=min_box_displacement_m,
         box_expand_ratio=box_expand_ratio,
+        debug_dir=debug_dir,
     )
 
     merged = merge_depth_maps_in_ego0(
@@ -564,22 +588,22 @@ def run_render_pipeline(
         conf_percentile=conf_percentile,
         point_filters=point_filters,
     )
-    rendered_paths = render_all_camera_views(merged, frames, camera, output_dir / log_id)
+    rendered_paths = render_all_camera_views(merged, frames, camera, output_dir / scene_id)
 
     np.savez(
-        output_dir / log_id / "merged_pointcloud.npz",
+        output_dir / scene_id / "merged_pointcloud.npz",
         points_ego0=merged.points_ego0,
         points_cam0=merged.points_cam0,
         colors=merged.colors,
     )
-    np.savez(output_dir / log_id / "predictions.npz", **predictions)
+    np.savez(output_dir / scene_id / "predictions.npz", **predictions)
 
     comparison_path: Path | None = None
     if save_comparison:
         comparison_path = save_comparison_gif(
             [Path(path) for path in image_paths],
             rendered_paths,
-            output_dir / log_id / "comparison.gif",
+            output_dir / scene_id / "comparison.gif",
             crop_bottom=crop_bottom_pixels,
             width=camera.width_px,
             height=camera.height_px,
@@ -610,11 +634,19 @@ def parse_args() -> argparse.Namespace:
         }
 
     parser = argparse.ArgumentParser(
-        description="VGGT AV2 inference, fusion, and render pipeline",
+        description="VGGT Waymo inference, fusion, and render pipeline",
         parents=[pre_parser],
     )
-    parser.add_argument("--data-root", type=Path, default=defaults.get("data_root", Path("argoverse2")))
-    parser.add_argument("--log-id", default=defaults.get("log_id"))
+    parser.add_argument(
+        "--data-root",
+        type=Path,
+        default=defaults.get(
+            "data_root",
+            Path("/home/jovyan/datasets/self-driving/waymo/waymo_open_dataset_v_2_0_1"),
+        ),
+    )
+    parser.add_argument("--split", default=defaults.get("split", "training"))
+    parser.add_argument("--scene-id", default=defaults.get("scene_id"))
     parser.add_argument("--frame-start", type=int, default=defaults.get("frame_start"))
     parser.add_argument("--frame-end", type=int, default=defaults.get("frame_end"))
     parser.add_argument("--checkpoint", type=Path, default=defaults.get("checkpoint"))
@@ -625,10 +657,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--crop-bottom",
         type=int,
-        default=defaults.get("crop_bottom", DEFAULT_AV2_CROP_BOTTOM),
+        default=defaults.get("crop_bottom", DEFAULT_WAYMO_CROP_BOTTOM),
     )
     parser.add_argument("--crop-cache-dir", type=Path, default=defaults.get("crop_cache_dir"))
     parser.add_argument("--sky-mask-cache-dir", type=Path, default=defaults.get("sky_mask_cache_dir"))
+    parser.add_argument("--image-cache-dir", type=Path, default=defaults.get("image_cache_dir"))
     parser.add_argument("--conf-percentile", type=float, default=defaults.get("conf_percentile", 0.0))
     parser.add_argument(
         "--no-metric-alignment",
@@ -651,31 +684,26 @@ def parse_args() -> argparse.Namespace:
         "--dynamic-filter-mode",
         choices=("combined", "sam2", "box"),
         default=defaults.get("dynamic_filter_mode", "combined"),
-        help="combined=SAM for all + 3D box when scale ok (default), sam2, or box",
     )
     parser.add_argument(
         "--scale-error-threshold",
         type=float,
         default=defaults.get("scale_error_threshold", DEFAULT_SCALE_ERROR_THRESHOLD),
-        help="Max median in-box LiDAR/pred depth error for extra 3D-box filtering",
     )
     parser.add_argument(
         "--min-box-displacement-m",
         type=float,
         default=defaults.get("min_box_displacement_m", DEFAULT_MIN_BOX_DISPLACEMENT_M),
-        help="Min city-frame box displacement over the chunk to treat object as moving (default 0.2m)",
     )
     parser.add_argument(
         "--box-filter-expand-ratio",
         type=float,
         default=defaults.get("box_filter_expand_ratio", DEFAULT_BOX_FILTER_EXPAND_RATIO),
-        help="Expand 3D/2D dynamic boxes by this factor for filtering (default 1.15)",
     )
     parser.add_argument(
         "--max-lidar-prompt-points",
         type=int,
         default=defaults.get("max_lidar_prompt_points", DEFAULT_MAX_LIDAR_PROMPT_POINTS),
-        help="Max LiDAR points per SAM prompt (default 12)",
     )
     parser.add_argument(
         "--sam2-model-id",
@@ -683,42 +711,41 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--sam2-cache-dir", type=Path, default=defaults.get("sam2_cache_dir"))
     parser.add_argument(
-        "--debug-dynamic-filter",
-        action=argparse.BooleanOptionalAction,
-        default=defaults.get("debug_dynamic_filter", False),
+        "--dynamic-mask-cache-dir",
+        type=Path,
+        default=defaults.get("dynamic_mask_cache_dir"),
     )
     parser.add_argument(
         "--sliding-window",
         action=argparse.BooleanOptionalAction,
         default=defaults.get("sliding_window", False),
-        help="Process full scene with sliding window (precompute masks, then merge+render)",
     )
     parser.add_argument(
         "--merge-frames",
         type=int,
         default=defaults.get("merge_frames", 8),
-        help="Number of frames to fuse per window (render uses pose of the next frame)",
-    )
-    parser.add_argument(
-        "--dynamic-mask-cache-dir",
-        type=Path,
-        default=defaults.get("dynamic_mask_cache_dir"),
-        help="Directory for precomputed per-frame dynamic SAM masks",
     )
     parser.add_argument(
         "--skip-mask-precompute",
         action=argparse.BooleanOptionalAction,
         default=defaults.get("skip_mask_precompute", False),
-        help="Reuse existing cached scene masks without recomputing",
+    )
+    parser.add_argument(
+        "--debug-dynamic-filter",
+        action=argparse.BooleanOptionalAction,
+        default=defaults.get("debug_dynamic_filter", False),
+        help="Save SAM prompts, per-stage masks, and overlays under scene dynamic_debug/",
     )
 
     parser.parse_args(remaining, namespace=pre_args)
     args = pre_args
+    if args.scene_id is not None:
+        args.scene_id = str(args.scene_id)
 
     if args.sliding_window:
-        required = ("log_id", "checkpoint", "output_dir")
+        required = ("scene_id", "checkpoint", "output_dir")
     else:
-        required = ("log_id", "frame_start", "frame_end", "checkpoint", "output_dir")
+        required = ("scene_id", "frame_start", "frame_end", "checkpoint", "output_dir")
     missing = [name for name in required if getattr(args, name.replace("-", "_"), None) is None]
     if missing:
         parser.error(
@@ -737,11 +764,12 @@ def main() -> None:
     if args.sliding_window:
         scene_dir, rendered_paths, depth_paths, video_path, comparison_path = run_sliding_window_scene_pipeline(
             data_root=args.data_root,
-            log_id=args.log_id,
+            scene_id=args.scene_id,
             frame_start=args.frame_start,
             frame_end=args.frame_end,
             checkpoint_path=args.checkpoint,
             output_dir=args.output_dir,
+            split=args.split,
             merge_frames=args.merge_frames,
             target_fps=args.target_fps,
             image_resolution=args.image_resolution,
@@ -749,7 +777,7 @@ def main() -> None:
             crop_bottom_pixels=crop_bottom,
             crop_cache_dir=args.crop_cache_dir,
             sky_mask_cache_dir=args.sky_mask_cache_dir,
-            dynamic_mask_cache_dir=dynamic_mask_cache_dir,
+            image_cache_dir=args.image_cache_dir,
             conf_percentile=args.conf_percentile,
             align_metric=not args.no_metric_alignment,
             save_comparison=not args.no_comparison_gif,
@@ -761,11 +789,15 @@ def main() -> None:
             box_expand_ratio=args.box_filter_expand_ratio,
             max_lidar_points=args.max_lidar_prompt_points,
             sam2_model_id=args.sam2_model_id,
+            dynamic_mask_cache_dir=dynamic_mask_cache_dir,
             skip_mask_precompute=args.skip_mask_precompute,
+            debug_dynamic_filter=args.debug_dynamic_filter,
         )
         print(f"Saved scene outputs to {scene_dir}")
         print(f"  rgb:   {len(rendered_paths)} frames in {scene_dir / 'rgb'}")
         print(f"  depth: {len(depth_paths)} npz files in {scene_dir / 'depth'}")
+        if args.debug_dynamic_filter:
+            print(f"  dynamic debug: {scene_dir / 'dynamic_debug'}")
         if video_path is not None:
             print(f"  video: {video_path}")
         if comparison_path is not None:
@@ -774,17 +806,19 @@ def main() -> None:
 
     _, rendered_paths, comparison_path = run_render_pipeline(
         data_root=args.data_root,
-        log_id=args.log_id,
+        scene_id=args.scene_id,
         frame_start=args.frame_start,
         frame_end=args.frame_end,
         checkpoint_path=args.checkpoint,
         output_dir=args.output_dir,
+        split=args.split,
         target_fps=args.target_fps,
         image_resolution=args.image_resolution,
         device=args.device,
-        crop_bottom_pixels=0 if args.no_crop else args.crop_bottom,
+        crop_bottom_pixels=crop_bottom,
         crop_cache_dir=args.crop_cache_dir,
         sky_mask_cache_dir=args.sky_mask_cache_dir,
+        image_cache_dir=args.image_cache_dir,
         conf_percentile=args.conf_percentile,
         align_metric=not args.no_metric_alignment,
         save_comparison=not args.no_comparison_gif,
@@ -798,11 +832,11 @@ def main() -> None:
         sam2_cache_dir=args.sam2_cache_dir,
         debug_dynamic_filter=args.debug_dynamic_filter,
     )
-    print(f"Saved {len(rendered_paths)} renders to {args.output_dir / args.log_id}")
+    print(f"Saved {len(rendered_paths)} renders to {args.output_dir / args.scene_id}")
+    if args.debug_dynamic_filter:
+        print(f"Saved dynamic filter debug to {args.output_dir / args.scene_id / 'dynamic_debug'}")
     if comparison_path is not None:
         print(f"Saved comparison GIF to {comparison_path}")
-    if args.debug_dynamic_filter:
-        print(f"Saved dynamic filter debug to {args.output_dir / args.log_id / 'dynamic_debug'}")
 
 
 if __name__ == "__main__":

@@ -94,15 +94,25 @@ def segment_sky(image_path: str, onnx_session, mask_filename: str) -> np.ndarray
 
 
 def _load_skyseg_session(skyseg_model_path: str = "skyseg.onnx"):
+    """Load skyseg ONNX model for inference-only segmentation (no torch grad/eval)."""
     if not os.path.exists(skyseg_model_path):
         download_file_from_url(
             "https://huggingface.co/JianyuanWang/skyseg/resolve/main/skyseg.onnx",
             skyseg_model_path,
         )
 
-    import onnxruntime
+    import onnxruntime as ort
 
-    return onnxruntime.InferenceSession(skyseg_model_path)
+    sess_options = ort.SessionOptions()
+    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    available = set(ort.get_available_providers())
+    providers = [p for p in providers if p in available] or ["CPUExecutionProvider"]
+    return ort.InferenceSession(
+        skyseg_model_path,
+        sess_options=sess_options,
+        providers=providers,
+    )
 
 
 def _prediction_image_to_bgr(image: np.ndarray, height: int, width: int) -> np.ndarray:
