@@ -698,7 +698,8 @@ def parse_args() -> argparse.Namespace:
         "--min-box-displacement-m",
         type=float,
         default=defaults.get("min_box_displacement_m", DEFAULT_MIN_BOX_DISPLACEMENT_M),
-        help="Min city-frame box displacement over the chunk to treat object as moving (default 0.2m)",
+        help="Min city-frame box displacement over the chunk to treat object as moving (default 0.2m); "
+        "0.0 removes every dynamic-category box regardless of movement",
     )
     parser.add_argument(
         "--box-filter-expand-ratio",

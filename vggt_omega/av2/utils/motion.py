@@ -21,11 +21,19 @@ def moving_track_uuids(
     *,
     min_displacement_m: float = DEFAULT_MIN_BOX_DISPLACEMENT_M,
 ) -> frozenset[str]:
-    """Tracks whose box center moves more than min_displacement_m in city frame over the chunk."""
+    """Tracks whose box center moves more than min_displacement_m in city frame over the chunk.
+
+    A non-positive threshold disables the movement check: every track with a dynamic-category
+    box is treated as moving (including tracks seen in only one frame of the chunk), so all
+    dynamic-class objects get filtered.
+    """
     centers_by_track: dict[str, list[np.ndarray]] = defaultdict(list)
     for frame in frames:
         for box in dynamic_boxes(frame):
             centers_by_track[box.track_uuid].append(box_center_city(frame, box))
+
+    if min_displacement_m <= 0.0:
+        return frozenset(centers_by_track.keys())
 
     moving: set[str] = set()
     for track_uuid, centers in centers_by_track.items():
